@@ -1,0 +1,225 @@
+#!/usr/bin/php
+<?php
+
+$wd = dirname(__FILE__);
+chdir($wd);
+
+require('DbSimple/Generic.php');
+
+require('config');
+
+// To set values:
+// MYSQL_TEST_LOGIN_FILE=/home/maniaque/powerpower/poweradmin.cnf mysql_config_editor -v set --login-path=poweradmin --host=localhost --user=poweradmin --password
+
+// NOTE: Переименование происходит от пользователя powerpower
+// Он должен иметь доступ на использование базы pdns, поскольку будет в ней переименовывать
+
+say('start');
+
+// mysqldump
+$md_binary          = 'mysqldump';
+$md_binary_options  = '--skip-comments --skip-extended-insert --no-autocommit';
+$file_poweradmin    = 'poweradmin.sql';
+
+// Сначала мы делаем общий дамп файла poweradmin.sql
+// Его нужно будет унести на одну или несколько машин
+
+$md_poweradmin = mysqldump_command($poweradmin, $wd, $md_binary, $md_binary_options, $file_poweradmin);
+
+if(empty($md_poweradmin)) fuck('mysqldump command is empty, exit');
+
+// Дамп валится в stdout, поэтому stderr туда не надо
+exec_or($md_poweradmin, /* redirect stderr = */ false);
+say('poweradmin export complete');
+
+foreach ($targets as $name => $server) {
+  say("processing $name");
+
+  $interim  = $server->interim;
+  $target   = $server->target;
+
+  $file = "$name.sql";
+
+  // $md_target = implode(" ", [ $md_binary, $md_binary_options, credentials($target), $target->database, '>', $file ]);
+  $md_target = mysqldump_command($target, $wd, $md_binary, $md_binary_options, $file);
+
+  // Дамп валится в stdout, поэтому stderr туда не надо
+  exec_or($md_target, /* redirect stderr = */ false);
+  say("$name export complete");
+
+  $diff_result = exec_do(implode(' ', [ 'diff', $file_poweradmin, $file ]));
+
+  if(!$diff_result['code']) {
+    say("$name is already synced");
+    continue;
+  }
+  
+  // Выполняем sync
+  $db = DbSimple_Generic::connect(connectionString($interim));
+
+  // Получаем таблицы в базе
+  $sql = "SELECT CONCAT(table_schema, '.', table_name)
+          FROM information_schema.tables 
+          WHERE table_schema = ?";
+  $db_tables = $db->selectCol($sql, $interim->database);
+
+  // Если есть хоть одна, то дропаем
+  if(count($db_tables)) $db->query('DROP TABLE ' . implode(', ', $db_tables));
+
+  // Готовим команду для импорта
+  $md_import_poweradmin = implode(" ", [
+    'mysql', credentials($interim), $interim->database, '<', $file_poweradmin
+  ]);
+
+  // Выполняем импорт
+  exec_or($md_import_poweradmin);
+  say("$name import complete");
+
+  // Теперь строим уберзапрос на переименование
+  $sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = ?";
+
+  $tables_interim = $db->selectCol($sql, $interim->database);
+  $tables_target = $db->selectCol($sql, $target->database);
+
+  $rename_simple = [];    // Это когда мы просто переименовываем таблицу, без промежуточных
+  $rename_complex = [];   // Это когда с промежуточными
+
+  foreach ($tables_interim as $t) {
+    if(in_array($t, $tables_target)) $rename_complex[] = $t;
+    else $rename_simple[] = $t;
+  }
+
+  $interim_db = $interim->database;
+  $target_db = $target->database;
+
+  $rename_list = [];
+  $drop_list = [];
+
+  foreach ($rename_simple as $rs) {
+    // powerpower.a -> pdns.a
+    $rename_list[] = "{$interim_db}.{$rs} TO {$target_db}.{$rs}";
+  }
+
+  foreach ($rename_complex as $rc) {
+    // pdns.a -> pdns.a_prev
+    $rename_list[] = "{$target_db}.{$rc} TO {$target_db}.{$rc}_prev";
+
+    // powerpower.a -> pdns.a
+    $rename_list[] = "{$interim_db}.{$rc} TO {$target_db}.{$rc}";
+
+    // pdns.a_prev - в дроплист
+    $drop_list[] = "{$target_db}.{$rc}_prev";
+  }
+
+  // Удаляем таблицы _prev, если они почему-то еще есть в базе
+  if(count($drop_list)) $db->query('DROP TABLE ' . implode(', ', $drop_list));
+
+  $sql = 'RENAME TABLE ' . implode(', ', $rename_list);
+  $rename = $db->query($sql);
+  say("$name rename table complete");
+
+  // Если в базе уже были неудаленные таблицы или что-то еще, то нам вернется false
+  if($rename === false) fuck('error on RENAME TABLE');
+
+  // Теперь удаляем таблицы _prev
+  if(count($drop_list)) $db->query('DROP TABLE ' . implode(', ', $drop_list));
+
+  say("$name complete");
+}
+
+// Теперь poweradmin.sql нужно скопировать в директорию repository
+if(!copy($file_poweradmin, $repository.'/'.$file_poweradmin))
+  fuck('error on file copy to repository');
+
+// Ну и вызвать там git commit
+chdir($repository);
+
+// http://stackoverflow.com/questions/5139290/how-to-check-if-theres-nothing-to-be-committed-in-the-current-branch
+exec_or("git add *");
+$git_status = exec_do("git status --porcelain");
+$git_status_output = $git_status['output'];
+
+$timestamp = date('Ymd-His');
+if(count($git_status_output)) exec_or("git commit -am '{$timestamp}'");
+
+exec_do("git push origin master");          // Это может пройти с ошибкой, пох
+
+win('done');
+
+function connectionString($object) {
+  return 'mysqli://'.$object->user.':'.$object->password.'@'.$object->host.'/'.$object->database;
+}
+
+function credentials($object) { return "-h $object->host -u $object->user -p{$object->password}"; }
+
+function mysqldump_command($object, $wd, $md_binary, $md_binary_options, $file) {
+  $returnValue = '';
+  
+  if(!empty($object->file) && !empty($object->path)) {
+    // Есть файл с реквизитами доступа, нужно использовать его
+    $login_file = "$wd/$object->file";
+    
+    say("credentials from $login_file, path {$object->path}");
+    
+    // login-path должно быть первой опцией, до остальных!
+    $returnValue = implode(" ", [
+      "MYSQL_TEST_LOGIN_FILE=$login_file",
+      $md_binary,
+      "--login-path={$object->path}",
+      $md_binary_options, $object->database, '>', $file
+    ]);
+  } else {
+    // Файла нет, строим обычную команду
+    say("usual credentials");
+
+    $returnValue = implode(" ", [
+      $md_binary, $md_binary_options, credentials($object), $object->database, '>', $file
+    ]);
+  }
+
+  return $returnValue;
+}
+
+function exec_do($command, $redirect_stderr = true) {
+  $output = array();
+  $return_var = 0;
+
+  // 2>&1 на конец
+  if($redirect_stderr) $command .= " 2>&1";
+
+  $exec_result = exec($command, $output, $return_var);
+
+  // // trace
+  // foreach($output as $o) { trace($o); }
+
+  return array('code' => $return_var, 'output' => $output);
+}
+
+function exec_or($command, $redirect_stderr = true) {
+  $exec_result = exec_do($command, $redirect_stderr);
+
+  // stderr выполняемой команды направлен в $output ( 2>&1 )
+  // поэтому мы его на экране не увидим
+  // в trace он попадет
+  // если мы сделаем whimper, то запишем его в trace еще раз
+  // поэтому тут выводим $output только в наш stderr (он смотрит в консоль)
+  
+  if($exec_result['code']) {
+    foreach($exec_result['output'] as $o) { file_put_contents('php://stderr', "$o\n"); }
+    fuck("ERROR: $command");
+  }
+
+  return $exec_result;
+}
+
+function say($text) { $timestamp = date('H:i:s'); echo "[$timestamp] $text\n"; }
+
+function whimper($text) { $timestamp = date('H:i:s'); file_put_contents('php://stderr', "[$timestamp] $text\n"); }
+
+function fuck($text) { whimper($text); fail(); }
+
+function fail() { exit_with(1); }
+
+function win($text = '') { if(!empty($text)) say($text); exit_with(0); }
+
+function exit_with($code) { exit($code); }

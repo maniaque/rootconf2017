@@ -1,0 +1,57 @@
+<?php
+
+$repository = 'repository';
+
+$poweradmin = new stdClass();
+
+$poweradmin->host         = 'localhost';
+$poweradmin->user         = 'poweradmin';
+$poweradmin->password     = '';
+$poweradmin->database     = 'poweradmin';
+$poweradmin->file         = 'poweradmin.cnf';
+$poweradmin->path         = 'poweradmin';
+
+// primary
+$primary = new stdClass();
+
+$primary->interim = new stdClass();
+
+$primary->interim->host               = 'localhost';
+$primary->interim->user               = 'powerpower';
+$primary->interim->password           = '';
+$primary->interim->database           = 'powerpower';
+
+$primary->target = new stdClass();
+
+$primary->target->host                = 'localhost';
+$primary->target->user                = 'pdns';
+$primary->target->password            = '';
+$primary->target->database            = 'pdns';
+$primary->target->file                = 'pdns.cnf';
+$primary->target->path                = 'pdns';
+
+// secondary
+$secondary = new stdClass();
+
+$secondary->interim = new stdClass();
+
+$secondary->interim->host             = 'localhost';
+$secondary->interim->user             = 'powerpower';
+$secondary->interim->password         = '';
+$secondary->interim->database         = 'powerpower';
+
+$secondary->target = new stdClass();
+
+$secondary->target->host              = 'localhost';
+$secondary->target->user              = 'pdns';
+$secondary->target->password          = '';
+$secondary->target->database          = 'pdns';
+$secondary->target->file              = 'pdns.cnf';
+$secondary->target->path              = 'pdns';
+
+
+// targets
+$targets = [
+  'primary' => $primary,
+  'secondary' => $secondary
+];

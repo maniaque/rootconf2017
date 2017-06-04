@@ -1,0 +1,215 @@
+#!/usr/bin/php
+<?php
+
+chdir(dirname(__FILE__));
+
+require('DbSimple/Generic.php');
+
+require('config');
+
+// poweradmin и так есть
+$pdns = $localhost->target;
+
+$db_pdns = DbSimple_Generic::connect(connectionString($pdns));
+$db_poweradmin = DbSimple_Generic::connect(connectionString($poweradmin));
+
+$db_pdns->setErrorHandler('sql_error');
+$db_poweradmin->setErrorHandler('sql_error');
+
+// Находим slave-домены
+$sql = "SELECT id, name FROM domains WHERE type='SLAVE'";
+$slaves = $db_pdns->select($sql);
+
+$slaves_ids = array_column($slaves, 'id');
+$slaves_names = array_column($slaves, 'name');
+say(count($slaves_ids) . ' slaves found');
+
+// Теперь получаем их записи
+$sql = "SELECT domain_id AS ARRAY_KEY1, r.id AS ARRAY_KEY2, r.* 
+        FROM records r WHERE domain_id IN (?a)";
+$records = $db_pdns->select($sql, $slaves_ids);
+
+// Теперь поехали по каждому домену
+// domain_id должен совпадать
+// Если он не совпадает, то нужно просто подождать следующей синхронизации
+for ($i = 0; $i < count($slaves_ids); $i++) { 
+  if(!process_domain(
+    $slaves_ids[$i], $slaves_names[$i], $records[$slaves_ids[$i]], $db_poweradmin)) {
+
+    fuck('errors on sql');
+  }
+}
+
+win();
+
+function process_domain($domain_id, $domain, $records, $db) {
+  // Сначала нужно получить id домена, попутно проверив, что он slave
+  $sql = "SELECT id FROM domains WHERE id = ?d AND type='SLAVE'";
+  $domain_id = $db->selectCell($sql, $domain_id, $domain);
+
+  say($domain_id . " => " . $domain);
+
+  if(empty($domain_id)) {
+    whimper("$domain is not found as slave by domain_id in poweradmin, skip it");
+    return true;
+  }
+
+  $db->query('BEGIN');
+
+  $sql = "SELECT * FROM records WHERE domain_id = ?d";
+  $current_records = $db->select($sql, $domain_id);
+
+  $queries = compare_records($current_records, $records);
+  $insert = $queries['insert'];
+  $delete = $queries['delete'];
+  
+  say(count($insert) . ' inserts');
+  say(count($delete) . ' delete');
+
+  $error = false;
+  foreach($insert as $i) {
+    $sql = "INSERT INTO records(?#) VALUES(?a)";
+    $id = $db->selectCell($sql, array_keys($i), array_values($i));
+    
+    if(!$id) {
+      $error = true;
+      whimper('error on insert ' . flat($i));
+      break;
+    }
+  }
+
+  if(!$error) {
+    foreach($delete as $d) {
+      $sql = "DELETE FROM records WHERE id = ?d";
+
+      $del = $db->selectCell($sql, $d['id']);
+
+      if(!$del) {
+        $error = true;
+
+        whimper('error on delete ' . flat($d));
+        break;
+      }
+    }
+  }
+
+  if(!$error) $db->query('COMMIT'); else $db->query('ROLLBACK');
+
+  return !$error;
+}
+
+function compare_records($current_raw, $new_raw) {
+  // poweradmin                   pdns
+  // test1.ru                     test1.ru
+  // <>                           test2.ru
+  // test3.ru                     <>
+
+  $current = []; $new = [];
+
+  foreach($new_raw as $n) {
+    unset($n['id']);
+    $new[] = $n;
+  }
+
+  foreach($current_raw as $c) {
+    unset($c['id']);
+    $current[] = $c;
+  }
+
+  // Если какая-то запись есть в new, но ее нет в current -> insert
+  $insert = [];
+  foreach ($new as $n) {
+    $found = false;
+    foreach ($current as $c) {
+      if($c === $n) { // из new нашли в current, break
+        $found = true;
+        break;
+      }
+    }
+    if(!$found) $insert[] = $n;
+  }
+
+  // Если какая-то запись есть в current, но ее нет в new -> delete
+  $delete = [];
+  // foreach ($current as $c) {
+  for ($i = 0; $i < count($current); $i++) { 
+    $c = $current[$i];
+
+    $found = false;
+    foreach ($new as $n) {
+      if($c === $n) { // из current нашли в new, break
+        $found = true;
+        break;
+      }
+    }
+    if(!$found) $delete[] = $current_raw[$i];     // id нам нужен для удаления, берем из current_raw
+  }
+
+  return [ 'delete' => $delete, 'insert' => $insert ];
+}
+
+function flat($array) {
+  $returnValue = [];
+  foreach ($array as $key => $value) {
+    $returnValue[] = "$key => $value";
+  }
+  return implode(", ", $returnValue);
+}
+
+function sql_error($message, $info) {
+  if (!error_reporting()) return;
+
+  echo "SQL Error: $message<br><pre>";
+  print_r($info);
+  echo "</pre>";
+} 
+
+function connectionString($object) {
+  return 'mysqli://'.$object->user.':'.$object->password.'@'.$object->host.'/'.$object->database;
+}
+
+function credentials($object) { return "-h $object->host -u $object->user -p{$object->password}"; }
+
+function exec_do($command, $redirect_stderr = true) {
+  $output = array();
+  $return_var = 0;
+
+  // 2>&1 на конец
+  if($redirect_stderr) $command .= " 2>&1";
+
+  $exec_result = exec($command, $output, $return_var);
+
+  // // trace
+  // foreach($output as $o) { trace($o); }
+
+  return array('code' => $return_var, 'output' => $output);
+}
+
+function exec_or($command, $redirect_stderr = true) {
+  $exec_result = exec_do($command, $redirect_stderr);
+
+  // stderr выполняемой команды направлен в $output ( 2>&1 )
+  // поэтому мы его на экране не увидим
+  // в trace он попадет
+  // если мы сделаем whimper, то запишем его в trace еще раз
+  // поэтому тут выводим $output только в наш stderr (он смотрит в консоль)
+  
+  if($exec_result['code']) {
+    foreach($exec_result['output'] as $o) { file_put_contents('php://stderr', "$o\n"); }
+    fuck("ERROR: $command");
+  }
+
+  return $exec_result;
+}
+
+function say($text) { $timestamp = date('H:i:s'); echo "[$timestamp] $text\n"; }
+
+function whimper($text) { file_put_contents('php://stderr', "$text\n"); }
+
+function fuck($text) { whimper($text); fail(); }
+
+function fail() { exit_with(1); }
+
+function win($text = '') { if(!empty($text)) say($text); exit_with(0); }
+
+function exit_with($code) { exit($code); }

@@ -1,0 +1,24 @@
+#!/bin/bash
+
+if [[ $EUID -ne 0 ]]; then
+  echo "this script must be run as root" 1>&2
+  exit 1
+fi
+
+cd "$(dirname "$0")"
+
+./slavery
+
+if [ "$?" -ne 0 ]; then
+  echo "slavery run failed :("
+  exit 2
+fi
+
+./powerpower
+
+if [ "$?" -ne 0 ]; then
+  echo "powerpower run failed :("
+  exit 3
+fi
+
+exit 0

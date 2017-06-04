@@ -1,0 +1,23 @@
+[Unit]
+Description=Unbound recursive Domain Name Server
+After=network-online.target remote-fs.target systemd-journald-dev-log.socket
+Wants=network-online.target nss-lookup.target
+Before=nss-lookup.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+TimeoutStopSec=5
+StartLimitInterval=0
+EnvironmentFile=-/etc/default/unbound
+ExecStartPre=/usr/sbin/unbound-checkconf
+# Uncomment the line below and point unbound to this file with "auto-trust-anchor-file"
+#ExecStartPre=-/usr/sbin/unbound-anchor -a <keyfile> -v
+ExecStart=/usr/sbin/unbound -d $DAEMON_OPTS
+ExecReload=/usr/sbin/unbound-control reload
+LimitNOFILE=infinity
+LimitNPROC=infinity
+
+[Install]
+WantedBy=multi-user.target
